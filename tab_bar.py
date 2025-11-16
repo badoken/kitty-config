@@ -12,7 +12,7 @@ from kitty.tab_bar import (
     draw_tab_with_powerline,
 )
 
-LEFT_HALF_CIRCLE = ""
+LEFT_HALF_TRIANGLE = ""
 CHARGING_ICON = "󰚥 "
 UNPLUGGED_ICONS = {
     10: "󰂃 ",
@@ -112,7 +112,7 @@ def _draw_right_status(screen: Screen, is_last: bool, draw_data: DrawData) -> in
     for c in cells:
         icon_bg_color = as_rgb(int(to_color(c["icon_bg_color"])))
         screen.cursor.fg = icon_bg_color
-        screen.draw(LEFT_HALF_CIRCLE)
+        screen.draw(LEFT_HALF_TRIANGLE)
 
         screen.cursor.bg = icon_bg_color
         screen.cursor.fg = 1
