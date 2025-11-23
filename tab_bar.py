@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 from datetime import datetime
 from time import monotonic
+import json
 import subprocess
 
 from kitty.boss import get_boss
@@ -26,46 +27,113 @@ SEPARATOR_SYMBOL, SOFT_SEPARATOR_SYMBOL = ("", "")
 RIGHT_MARGIN = 1
 REFRESH_TIME = 1
 
-ICON_ACTIVE = "󰑮 "
-ICON_INACTIVE = "󰫁 "
+# Taskwarrior-related UI
+working_color = as_rgb(color_as_int(opts.color2))
+ICON_ACTIVE = "󰑮"
+ICON_INACTIVE = ""
 
-# Cache Taskwarrior status a bit so we don't shell out too often
-TASK_REFRESH_SECONDS = 1.0
+# Cache Taskwarrior status so we don't shell out too often
+TASK_REFRESH_SECONDS = 2.0
 _last_task_check = 0.0
 _last_has_active_task = False
+_last_task_id = None
+_last_task_start = None
 
 
-def has_active_task() -> bool:
-    """Return True if Taskwarrior reports any active (started) tasks."""
-    global _last_task_check, _last_has_active_task
+def _parse_task_datetime(value: str):
+    """Best-effort parse of Taskwarrior datetime string into a naive datetime.
+
+    Taskwarrior usually uses formats like YYYYMMDDTHHMMSS or YYYYMMDDTHHMMSSZ.
+    We ignore timezone and treat it as local time for relative calculations.
+    """
+
+    if not value:
+        return None
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _update_task_cache() -> None:
+    """Refresh cached Taskwarrior info (id + start time of an active task)."""
+
+    global _last_task_check, _last_has_active_task, _last_task_id, _last_task_start
+
     now = monotonic()
     if now - _last_task_check < TASK_REFRESH_SECONDS:
-        return _last_has_active_task
+        return
 
     _last_task_check = now
     try:
-        # +ACTIVE is Taskwarrior's virtual tag for started tasks
         proc = subprocess.run(
-            ["task", "+ACTIVE", "count"],
+            ["task", "+ACTIVE", "export"],
             capture_output=True,
             text=True,
-            timeout=0.2,
+            timeout=0.5,
         )
-        if proc.returncode != 0:
-            _last_has_active_task = False
-        else:
-            out = proc.stdout.strip() or "0"
-            _last_has_active_task = int(out) > 0
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        # If task is not installed or something goes wrong, fall back to no-active
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         _last_has_active_task = False
+        _last_task_id = None
+        _last_task_start = None
+        return
 
-    return _last_has_active_task
+    if proc.returncode != 0 or not proc.stdout.strip():
+        _last_has_active_task = False
+        _last_task_id = None
+        _last_task_start = None
+        return
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        _last_has_active_task = False
+        _last_task_id = None
+        _last_task_start = None
+        return
+
+    if not data:
+        _last_has_active_task = False
+        _last_task_id = None
+        _last_task_start = None
+        return
+
+    task = data[0]
+    _last_task_id = task.get("id")
+    _last_task_start = _parse_task_datetime(task.get("start", ""))
+    _last_has_active_task = _last_task_id is not None and _last_task_start is not None
 
 
-def get_icon() -> str:
-    return ICON_ACTIVE if has_active_task() else ICON_INACTIVE
+def get_task_display_fields():
+    _update_task_cache()
 
+    if not _last_has_active_task:
+        # No active task: reserve the space but leave id/time blank
+        return [(" _", icon_fg), (ICON_INACTIVE, icon_fg), ("  :  ", icon_fg)]
+
+    # ID: clamp to 1–99 and render into a 2-char field
+    try:
+        task_id_int = int(_last_task_id)
+    except (TypeError, ValueError):
+        task_id_int = 0
+    if task_id_int <= 0:
+        id_str = "  "
+    else:
+        task_id_int = min(task_id_int, 99)
+        id_str = f"{task_id_int:2d}"
+
+    # Elapsed time since "start" in hh:mm, capped at 99h
+    elapsed_str = "     "
+    if _last_task_start is not None:
+        delta = datetime.now() - _last_task_start
+        total_minutes = max(int(delta.total_seconds() // 60), 0)
+        hours = min(total_minutes // 60, 99)
+        minutes = total_minutes % 60
+        elapsed_str = f"{hours:02d}:{minutes:02d}"
+
+    return [(id_str, icon_fg), (ICON_ACTIVE, working_color), (elapsed_str, icon_fg)]
 
 UNPLUGGED_ICONS = {
     10: "󰁺",
@@ -94,16 +162,24 @@ PLUGGED_COLORS = {
 }
 
 
-def _draw_icon(screen: Screen, index: int) -> int:
+def _draw_task(screen: Screen, index: int) -> int:
+    """Draw the Taskwarrior block: "NN ICON hh:mm"."""
+
     if index != 1:
         return 0
-    fg, bg = screen.cursor.fg, screen.cursor.bg
-    screen.cursor.fg = icon_fg
-    screen.cursor.bg = icon_bg
-    icon = get_icon()
-    screen.draw(icon)
-    screen.cursor.fg, screen.cursor.bg = fg, bg
-    screen.cursor.x = len(icon)
+
+    all_elements = ""
+    for element, color in get_task_display_fields():
+        fg, bg = screen.cursor.fg, screen.cursor.bg
+        screen.cursor.fg = color
+        screen.cursor.bg = icon_bg
+        element_on_tab = f"{element} "
+        screen.draw(element_on_tab)
+        screen.cursor.fg, screen.cursor.bg = fg, bg
+        all_elements += element_on_tab
+
+    # Reserve the full width for id + icon + time
+    screen.cursor.x = len(all_elements) 
     return screen.cursor.x
 
 
@@ -128,9 +204,7 @@ def _draw_left_status(
     else:
         next_tab_bg = default_bg
         needs_soft_separator = False
-    if screen.cursor.x <= len(ICON_ACTIVE):
-        # Ensure we don't overwrite the icon area
-        screen.cursor.x = len(ICON_ACTIVE)
+
     screen.draw(" ")
     screen.cursor.bg = tab_bg
     draw_title(draw_data, screen, tab, index)
@@ -225,7 +299,7 @@ def draw_tab(
     if timer_id is None:
         timer_id = add_timer(_redraw_tab_bar, REFRESH_TIME, True)
     clock = datetime.now().strftime(" %H:%M")
-    date = datetime.now().strftime(" %d.%m.%Y")
+    date = datetime.now().strftime(" %d.%m.%y")
     cells = get_battery_cells()
     cells.append((clock_color, clock))
     cells.append((date_color, date))
@@ -233,7 +307,7 @@ def draw_tab(
     for cell in cells:
         right_status_length += len(str(cell[1]))
 
-    _draw_icon(screen, index)
+    _draw_task(screen, index)
     _draw_left_status(
         draw_data,
         screen,
