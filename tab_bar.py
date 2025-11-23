@@ -1,5 +1,8 @@
 # pyright: reportMissingImports=false
 from datetime import datetime
+from time import monotonic
+import subprocess
+
 from kitty.boss import get_boss
 from kitty.fast_data_types import Screen, add_timer, get_options
 from kitty.utils import color_as_int
@@ -23,8 +26,46 @@ SEPARATOR_SYMBOL, SOFT_SEPARATOR_SYMBOL = ("", "")
 RIGHT_MARGIN = 1
 REFRESH_TIME = 1
 
-ICON = " "
-# 
+ICON_ACTIVE = "󰑮 "
+ICON_INACTIVE = "󰫁 "
+
+# Cache Taskwarrior status a bit so we don't shell out too often
+TASK_REFRESH_SECONDS = 1.0
+_last_task_check = 0.0
+_last_has_active_task = False
+
+
+def has_active_task() -> bool:
+    """Return True if Taskwarrior reports any active (started) tasks."""
+    global _last_task_check, _last_has_active_task
+    now = monotonic()
+    if now - _last_task_check < TASK_REFRESH_SECONDS:
+        return _last_has_active_task
+
+    _last_task_check = now
+    try:
+        # +ACTIVE is Taskwarrior's virtual tag for started tasks
+        proc = subprocess.run(
+            ["task", "+ACTIVE", "count"],
+            capture_output=True,
+            text=True,
+            timeout=0.2,
+        )
+        if proc.returncode != 0:
+            _last_has_active_task = False
+        else:
+            out = proc.stdout.strip() or "0"
+            _last_has_active_task = int(out) > 0
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        # If task is not installed or something goes wrong, fall back to no-active
+        _last_has_active_task = False
+
+    return _last_has_active_task
+
+
+def get_icon() -> str:
+    return ICON_ACTIVE if has_active_task() else ICON_INACTIVE
+
 
 UNPLUGGED_ICONS = {
     10: "󰁺",
@@ -59,9 +100,10 @@ def _draw_icon(screen: Screen, index: int) -> int:
     fg, bg = screen.cursor.fg, screen.cursor.bg
     screen.cursor.fg = icon_fg
     screen.cursor.bg = icon_bg
-    screen.draw(ICON)
+    icon = get_icon()
+    screen.draw(icon)
     screen.cursor.fg, screen.cursor.bg = fg, bg
-    screen.cursor.x = len(ICON)
+    screen.cursor.x = len(icon)
     return screen.cursor.x
 
 
@@ -86,8 +128,9 @@ def _draw_left_status(
     else:
         next_tab_bg = default_bg
         needs_soft_separator = False
-    if screen.cursor.x <= len(ICON):
-        screen.cursor.x = len(ICON)
+    if screen.cursor.x <= len(ICON_ACTIVE):
+        # Ensure we don't overwrite the icon area
+        screen.cursor.x = len(ICON_ACTIVE)
     screen.draw(" ")
     screen.cursor.bg = tab_bg
     draw_title(draw_data, screen, tab, index)
@@ -137,7 +180,6 @@ def get_battery_cells() -> list:
         with open("/sys/class/power_supply/BAT0/capacity", "r") as f:
             percent = int(f.read())
         if status == "Discharging\n":
-            # TODO: declare the lambda once and don't repeat the code
             icon_color = UNPLUGGED_COLORS[
                 min(UNPLUGGED_COLORS.keys(), key=lambda x: abs(x - percent))
             ]
